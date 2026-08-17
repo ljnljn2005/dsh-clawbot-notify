@@ -1,11 +1,12 @@
 {
   "name": "dsh-clawbot-notify",
-  "description": "DSH plugin: notify personal WeChat via ilink protocol (Weixin ClawBot) when a task completes, errors, or needs user input. Built-in QR login flow.",
+  "description": "DSH plugin: notify personal WeChat via ilink protocol (Weixin ClawBot) when a task completes, errors, or needs user input. Built-in QR login flow and WebUI settings panel.",
   "version": "0.1.0",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -31,6 +32,15 @@
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-settings": "^0.1.0"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "platform": "web"
+    }
   }
 }
