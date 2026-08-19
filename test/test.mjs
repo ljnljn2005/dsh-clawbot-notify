@@ -6,7 +6,7 @@
 // 5. 登录流程（mock get_bot_qrcode / get_qrcode_status → confirmed 保存凭据）
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, tmpdir as osTmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { Context } from "@deepseek-ai/cordis";
@@ -152,6 +152,125 @@ async function main() {
 	rmSync(testDir, { recursive: true, force: true });
 	const envDir = process.env.FINAL_ENV_DIR;
 	if (envDir) rmSync(envDir, { recursive: true, force: true });
+
+	// =====================================================================
+	// 场景6 双向控制 daemon：消息归一化、长轮询、回发
+	// =====================================================================
+	{
+		const { normalizeIncoming, chunkReplyText, markdownToPlainText, startIncomingDaemon, sendReply } = await import("../lib/daemon.js");
+
+		// 归一化：忽略 bot 自身消息（message_type 2）
+		const botMsg = { from_user_id: "userA", message_type: 2, item_list: [{ type: 1, text_item: { text: "hi" } }] };
+		assert.equal(normalizeIncoming(botMsg), null, "bot 自身消息应被忽略");
+
+		// 归一化：正常用户消息
+		const userMsg = {
+			from_user_id: "userA",
+			message_type: 1,
+			message_id: "m1",
+			context_token: "tok-1",
+			item_list: [{ type: 1, text_item: { text: "帮我查一下磁盘" } }],
+		};
+		const norm = normalizeIncoming(userMsg);
+		assert.ok(norm, "用户消息应被归一化");
+		assert.equal(norm.senderId, "userA");
+		assert.equal(norm.text, "帮我查一下磁盘");
+		assert.equal(norm.contextToken, "tok-1");
+
+		// 无文本消息应忽略
+		assert.equal(normalizeIncoming({ from_user_id: "userA", message_type: 1, item_list: [] }), null);
+
+		// markdown 简化
+		const plain = markdownToPlainText("**粗体** 和 `代码` 和 [链接](https://x.com) 和 # 标题");
+		assert.ok(!plain.includes("**"), "去掉粗体标记");
+		assert.ok(!plain.includes("`"), "去掉代码标记");
+
+		// 分片
+		const chunks = chunkReplyText("a".repeat(4000), 1800);
+		assert.ok(chunks.length >= 3, "长文本应分片");
+		assert.ok(chunks.every((c) => c.length <= 1800), "每片不超过上限");
+
+		// getupdates 长轮询 + daemon 消息分发
+		let getUpdatesCalls = 0;
+		const received = [];
+		const http = await import("node:http");
+		const daemonServer = http.createServer((req, res) => {
+			let body = "";
+			req.on("data", (c) => (body += c));
+			req.on("end", () => {
+				getUpdatesCalls += 1;
+				if (getUpdatesCalls === 1) {
+					res.writeHead(200, { "content-type": "application/json" });
+					res.end(JSON.stringify({
+						ret: 0,
+						get_updates_buf: "cursor-2",
+						longpolling_timeout_ms: 500,
+						msgs: [
+							{ from_user_id: "userA", message_type: 1, message_id: "m1", context_token: "tok-1", item_list: [{ type: 1, text_item: { text: "第一条" } }] },
+						],
+					}));
+				} else {
+					res.writeHead(200, { "content-type": "application/json" });
+					res.end(JSON.stringify({ ret: 0, get_updates_buf: `cursor-${getUpdatesCalls}`, msgs: [] }));
+				}
+			});
+		});
+		await new Promise((r) => daemonServer.listen(0, "127.0.0.1", r));
+		const daemonPort = daemonServer.address().port;
+
+		const daemon = startIncomingDaemon({
+			baseUrl: `http://127.0.0.1:${daemonPort}`,
+			token: "test-token",
+			handler: async (raw) => {
+				const n = normalizeIncoming(raw);
+				if (n) received.push(n.text);
+			},
+			onError: (e) => console.log("daemon error:", e),
+		});
+		await sleep(1200);
+		daemon.stop();
+		await daemon.settled();
+		daemonServer.close();
+		assert.ok(received.includes("第一条"), `daemon 应收到消息（收到: ${JSON.stringify(received)}）`);
+		assert.ok(getUpdatesCalls >= 2, `getupdates 应多次调用（当前 ${getUpdatesCalls}）`);
+		console.log("✓ 场景6 双向控制 daemon：归一化/长轮询/分发");
+
+		// 回发（sendReply 带 context_token）
+		const replyServer = http.createServer((req, res) => {
+			let body = "";
+			req.on("data", (c) => (body += c));
+			req.on("end", () => {
+				const parsed = JSON.parse(body);
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify({ ret: 0, msg: parsed }));
+			});
+		});
+		await new Promise((r) => replyServer.listen(0, "127.0.0.1", r));
+		const replyPort = replyServer.address().port;
+		const replyResult = await sendReply({
+			baseUrl: `http://127.0.0.1:${replyPort}`,
+			token: "test-token",
+			toUserId: "userA",
+			text: "回复内容",
+			contextToken: "tok-1",
+		});
+		replyServer.close();
+		assert.ok(replyResult.ok, "回发应成功");
+		console.log("✓ 场景7 双向控制：sendReply 回发");
+
+		// 会话偏好状态：记录/读取/持久化
+		const stateMod = await import("../lib/wechat-state.js");
+		const stateDir = join(osTmpdir(), `dcn-state-${Date.now()}`);
+		assert.equal(stateMod.loadSenderState(stateDir, "userA").current, "", "初始无偏好");
+		stateMod.rememberCurrentSession(stateDir, "userA", "session-1");
+		assert.equal(stateMod.loadSenderState(stateDir, "userA").current, "session-1", "偏好应持久化");
+		stateMod.rememberCurrentSession(stateDir, "userA", "session-2");
+		assert.equal(stateMod.loadSenderState(stateDir, "userA").current, "session-2", "偏好应可覆盖");
+		stateMod.forgetSenderState(stateDir, "userA");
+		assert.equal(stateMod.loadSenderState(stateDir, "userA").current, "", "应可清空");
+		rmSync(stateDir, { recursive: true, force: true });
+		console.log("✓ 场景8 会话偏好状态：记录/读取/持久化");
+	}
 
 	console.log("\n全部测试通过 ✅");
 }
